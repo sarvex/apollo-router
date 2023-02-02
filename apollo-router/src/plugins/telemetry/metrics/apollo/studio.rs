@@ -73,7 +73,7 @@ pub(crate) struct SingleQueryLatencyStats {
     pub(crate) private_cache_ttl_latency: Option<Duration>,
     pub(crate) registered_operation: bool,
     pub(crate) forbidden_operation: bool,
-    pub(crate) without_field_instrumentation: bool,
+    pub(crate) requests_without_field_instrumentation: u64,
 }
 
 impl Add<SingleQueryLatencyStats> for SingleQueryLatencyStats {
@@ -99,13 +99,13 @@ pub(crate) struct SingleTypeStat {
     pub(crate) per_field_stat: HashMap<String, SingleFieldStat>,
 }
 
-#[derive(Default, Debug, Serialize)]
+#[derive(Debug, Serialize)]
 pub(crate) struct SingleFieldStat {
     pub(crate) return_type: String,
     pub(crate) errors_count: u64,
     pub(crate) estimated_execution_count: f64,
     pub(crate) requests_with_errors_count: u64,
-    pub(crate) latency: Duration,
+    pub(crate) latency: DurationHistogram<f64>,
 }
 
 #[derive(Default, Debug, Serialize)]
@@ -127,14 +127,14 @@ impl AddAssign<SingleContextualizedStats> for ContextualizedStats {
 
 #[derive(Default, Debug, Serialize)]
 pub(crate) struct QueryLatencyStats {
-    request_latencies: DurationHistogram,
+    request_latencies: DurationHistogram<i64>,
     persisted_query_hits: u64,
     persisted_query_misses: u64,
-    cache_hits: DurationHistogram,
+    cache_hits: DurationHistogram<i64>,
     root_error_stats: PathErrorStats,
     requests_with_errors_count: u64,
-    public_cache_ttl_count: DurationHistogram,
-    private_cache_ttl_count: DurationHistogram,
+    public_cache_ttl_count: DurationHistogram<i64>,
+    private_cache_ttl_count: DurationHistogram<i64>,
     registered_operation_count: u64,
     forbidden_operation_count: u64,
     requests_without_field_instrumentation: u64,
@@ -142,23 +142,26 @@ pub(crate) struct QueryLatencyStats {
 
 impl AddAssign<SingleQueryLatencyStats> for QueryLatencyStats {
     fn add_assign(&mut self, stats: SingleQueryLatencyStats) {
-        self.request_latencies
-            .increment_duration(Some(stats.latency), 1);
+        self.request_latencies.increment_duration(stats.latency, 1);
         match stats.persisted_query_hit {
             Some(true) => self.persisted_query_hits += 1,
             Some(false) => self.persisted_query_misses += 1,
             None => {}
         }
-        self.cache_hits.increment_duration(stats.cache_latency, 1);
+        if let Some(latency) = stats.cache_latency {
+            self.cache_hits.increment_duration(latency, 1);
+        }
         self.root_error_stats += stats.root_error_stats;
         self.requests_with_errors_count += stats.has_errors as u64;
-        self.public_cache_ttl_count
-            .increment_duration(stats.public_cache_ttl_latency, 1);
-        self.private_cache_ttl_count
-            .increment_duration(stats.private_cache_ttl_latency, 1);
+        if let Some(latency) = stats.public_cache_ttl_latency {
+            self.public_cache_ttl_count.increment_duration(latency, 1);
+        }
+        if let Some(latency) = stats.private_cache_ttl_latency {
+            self.private_cache_ttl_count.increment_duration(latency, 1);
+        }
         self.registered_operation_count += stats.registered_operation as u64;
         self.forbidden_operation_count += stats.forbidden_operation as u64;
-        self.requests_without_field_instrumentation += stats.without_field_instrumentation as u64;
+        self.requests_without_field_instrumentation += stats.requests_without_field_instrumentation;
     }
 }
 
@@ -198,16 +201,29 @@ pub(crate) struct FieldStat {
     errors_count: u64,
     estimated_execution_count: f64,
     requests_with_errors_count: u64,
-    latency: DurationHistogram,
+    latency: DurationHistogram<f64>,
 }
 
 impl AddAssign<SingleFieldStat> for FieldStat {
     fn add_assign(&mut self, stat: SingleFieldStat) {
-        self.latency.increment_duration(Some(stat.latency), 1);
+        self.latency += stat.latency;
         self.requests_with_errors_count += stat.requests_with_errors_count;
         self.estimated_execution_count += stat.estimated_execution_count;
         self.errors_count += stat.errors_count;
         self.return_type = stat.return_type;
+    }
+}
+
+impl<T: AddAssign + Default + Copy> AddAssign for DurationHistogram<T> {
+    fn add_assign(&mut self, other: DurationHistogram<T>) {
+        self.entries += other.entries;
+        if self.buckets.len() < other.buckets.len() {
+            self.buckets.resize(other.buckets.len(), T::default())
+        }
+        self.buckets
+            .iter_mut()
+            .zip(other.buckets)
+            .for_each(|(slot, value)| *slot += value)
     }
 }
 
@@ -233,8 +249,8 @@ impl From<QueryLatencyStats>
     fn from(stats: QueryLatencyStats) -> Self {
         Self {
             latency_count: stats.request_latencies.buckets,
-            request_count: stats.request_latencies.entries,
-            cache_hits: stats.cache_hits.entries,
+            request_count: stats.request_latencies.entries as u64,
+            cache_hits: stats.cache_hits.entries as u64,
             cache_latency_count: stats.cache_hits.buckets,
             persisted_query_hits: stats.persisted_query_hits,
             persisted_query_misses: stats.persisted_query_misses,
@@ -282,10 +298,15 @@ impl From<FieldStat> for crate::plugins::telemetry::apollo_exporter::proto::repo
         Self {
             return_type: stat.return_type,
             errors_count: stat.errors_count,
-            observed_execution_count: stat.latency.entries,
+            observed_execution_count: stat.latency.entries as u64,
             estimated_execution_count: stat.estimated_execution_count as u64,
             requests_with_errors_count: stat.requests_with_errors_count,
-            latency_count: stat.latency.buckets,
+            latency_count: stat
+                .latency
+                .buckets
+                .iter()
+                .map(|&float| float as i64)
+                .collect(),
         }
     }
 }
@@ -383,7 +404,7 @@ mod test {
                             private_cache_ttl_latency: Some(Duration::from_secs(1)),
                             registered_operation: true,
                             forbidden_operation: true,
-                            without_field_instrumentation: true,
+                            requests_without_field_instrumentation: 1,
                         },
                         per_type_stat: HashMap::from([
                             (
@@ -424,7 +445,7 @@ mod test {
             errors_count: count.inc_u64(),
             estimated_execution_count: count.inc_f64(),
             requests_with_errors_count: count.inc_u64(),
-            latency: Duration::from_secs(1),
+            latency: DurationHistogram::new(None),
         }
     }
 

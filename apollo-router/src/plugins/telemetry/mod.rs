@@ -62,8 +62,10 @@ use self::apollo::ForwardValues;
 use self::apollo::SingleReport;
 use self::apollo_exporter::Sender;
 use self::config::Conf;
+use self::metrics::apollo::studio::SingleTypeStat;
 use self::metrics::AttributesForwardConf;
 use self::metrics::MetricsAttributesConf;
+use self::tracing::apollo_telemetry::decode_ftv1_trace;
 #[cfg(not(feature = "console"))]
 use crate::executable::GLOBAL_ENV_FILTER;
 use crate::layers::ServiceBuilderExt;
@@ -127,6 +129,7 @@ const CLIENT_NAME: &str = "apollo_telemetry::client_name";
 const CLIENT_VERSION: &str = "apollo_telemetry::client_version";
 const ATTRIBUTES: &str = "apollo_telemetry::metrics_attributes";
 const SUBGRAPH_ATTRIBUTES: &str = "apollo_telemetry::subgraph_metrics_attributes";
+const SUBGRAPH_FTV1: &str = "apollo_telemetry::subgraph_ftv1";
 pub(crate) const STUDIO_EXCLUDE: &str = "apollo_telemetry::studio::exclude";
 pub(crate) const LOGGING_DISPLAY_HEADERS: &str = "apollo_telemetry::logging::display_headers";
 pub(crate) const LOGGING_DISPLAY_BODY: &str = "apollo_telemetry::logging::display_body";
@@ -1195,6 +1198,8 @@ impl Telemetry {
                     ..Default::default()
                 }
             } else {
+                let (requests_without_field_instrumentation, per_type_stat) =
+                    Self::decode_subgraph_ftv1(context);
                 SingleStatsReport {
                     request_id: uuid::Uuid::from_bytes(
                         Span::current()
@@ -1223,9 +1228,10 @@ impl Telemetry {
                                     latency: duration,
                                     has_errors,
                                     persisted_query_hit,
+                                    requests_without_field_instrumentation,
                                     ..Default::default()
                                 },
-                                ..Default::default()
+                                per_type_stat,
                             },
                             referenced_fields_by_type: usage_reporting
                                 .referenced_fields_by_type
@@ -1244,6 +1250,58 @@ impl Telemetry {
             }
         };
         sender.send(SingleReport::Stats(metrics));
+    }
+
+    fn decode_subgraph_ftv1(context: &Context) -> (u64, HashMap<String, SingleTypeStat>) {
+        use crate::plugins::telemetry::apollo_exporter::proto::reports::trace::Node;
+
+        fn traverse(
+            per_type: &mut HashMap<String, SingleTypeStat>,
+            field_execution_weight: f64,
+            node: &Node,
+        ) {
+            let single_field_stat = per_type
+                .entry(node.parent_type.clone())
+                .or_default()
+                .per_field_stat
+                .entry(node.original_field_name.clone())
+                .or_insert_with(|| metrics::apollo::studio::SingleFieldStat {
+                    return_type: node.r#type.clone(), // not `Default::default()`’s empty string
+                    errors_count: 0,
+                    latency: Default::default(),
+                    estimated_execution_count: 0.0,
+                    requests_with_errors_count: 0,
+                });
+            single_field_stat.errors_count += node.error.len() as u64;
+            single_field_stat.latency.increment_duration(
+                Duration::from_nanos(node.end_time.saturating_sub(node.start_time)),
+                field_execution_weight,
+            );
+            single_field_stat.estimated_execution_count += field_execution_weight;
+            if !node.error.is_empty() {
+                single_field_stat.requests_with_errors_count += 1;
+            }
+            for child in &node.child {
+                traverse(per_type, field_execution_weight, child)
+            }
+        }
+
+        let mut requests_without_field_instrumentation = 0;
+        let mut per_type = HashMap::new();
+
+        if let Some(Value::Array(array)) = context.get_json_value(SUBGRAPH_FTV1) {
+            for trace in array
+                .iter()
+                .filter_map(|value| decode_ftv1_trace(value.as_str()?))
+            {
+                if trace.field_execution_weight == 0.0 {
+                    requests_without_field_instrumentation += 1;
+                } else if let Some(root) = &trace.root {
+                    traverse(&mut per_type, trace.field_execution_weight, root)
+                }
+            }
+        }
+        (requests_without_field_instrumentation, per_type)
     }
 }
 
@@ -1349,6 +1407,16 @@ impl ApolloFtv1Handler {
             {
                 // Record the ftv1 trace for processing later
                 Span::current().record("apollo_private.ftv1", ftv1.as_str());
+                resp.context
+                    .upsert_json_value(SUBGRAPH_FTV1, |value: Value| {
+                        let mut array = match value {
+                            Value::Array(array) => array,
+                            Value::Null => Vec::new(),
+                            _ => panic!("unexpected JSON value kind"),
+                        };
+                        array.push(Value::String(ftv1.clone()));
+                        Value::Array(array)
+                    })
             }
         }
         resp

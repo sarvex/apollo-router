@@ -1,13 +1,14 @@
+use std::ops::AddAssign;
 use std::time::Duration;
 
 use serde::Serialize;
 #[derive(Serialize, Debug)]
-pub(crate) struct DurationHistogram {
-    pub(crate) buckets: Vec<i64>,
-    pub(crate) entries: u64,
+pub(crate) struct DurationHistogram<T> {
+    pub(crate) buckets: Vec<T>,
+    pub(crate) entries: T,
 }
 
-impl Default for DurationHistogram {
+impl<T: AddAssign + Default + Copy> Default for DurationHistogram<T> {
     fn default() -> Self {
         DurationHistogram::new(None)
     }
@@ -20,14 +21,15 @@ impl Default for DurationHistogram {
 // telemetry framework and leads to dropped data spans. Given that the
 // histogram data is ultimately gzipped for transfer, I wasn't entirely
 // sure that this extra processing was worth performing.
-impl DurationHistogram {
+impl<T: AddAssign + Default + Copy> DurationHistogram<T> {
     const DEFAULT_SIZE: usize = 74; // Taken from TS implementation
     const MAXIMUM_SIZE: usize = 383; // Taken from TS implementation
     const EXPONENT_LOG: f64 = 0.09531017980432493f64; // ln(1.1) Update when ln() is a const fn (see: https://github.com/rust-lang/rust/issues/57241)
+
     pub(crate) fn new(init_size: Option<usize>) -> Self {
         Self {
-            buckets: vec![0; init_size.unwrap_or(DurationHistogram::DEFAULT_SIZE)],
-            entries: 0,
+            buckets: vec![T::default(); init_size.unwrap_or(Self::DEFAULT_SIZE)],
+            entries: T::default(),
         }
     }
 
@@ -35,30 +37,28 @@ impl DurationHistogram {
         // If you use as_micros() here to avoid the divide, tests will fail
         // Because, internally, as_micros() is losing remainders
         let log_duration = f64::ln(duration.as_nanos() as f64 / 1000.0);
-        let unbounded_bucket = f64::ceil(log_duration / DurationHistogram::EXPONENT_LOG);
+        let unbounded_bucket = f64::ceil(log_duration / Self::EXPONENT_LOG);
 
         if unbounded_bucket.is_nan() || unbounded_bucket <= 0f64 {
             return 0;
-        } else if unbounded_bucket > DurationHistogram::MAXIMUM_SIZE as f64 {
-            return DurationHistogram::MAXIMUM_SIZE;
+        } else if unbounded_bucket > Self::MAXIMUM_SIZE as f64 {
+            return Self::MAXIMUM_SIZE;
         }
 
         unbounded_bucket as usize
     }
 
-    pub(crate) fn increment_duration(&mut self, duration: Option<Duration>, value: i64) {
-        if let Some(duration) = duration {
-            self.increment_bucket(DurationHistogram::duration_to_bucket(duration), value)
-        }
+    pub(crate) fn increment_duration(&mut self, duration: Duration, value: T) {
+        self.increment_bucket(Self::duration_to_bucket(duration), value)
     }
 
-    fn increment_bucket(&mut self, bucket: usize, value: i64) {
-        if bucket > DurationHistogram::MAXIMUM_SIZE {
+    fn increment_bucket(&mut self, bucket: usize, value: T) {
+        if bucket > Self::MAXIMUM_SIZE {
             panic!("bucket is out of bounds of the bucket array");
         }
-        self.entries += value as u64;
+        self.entries += value;
         if bucket >= self.buckets.len() {
-            self.buckets.resize(bucket + 1, 0);
+            self.buckets.resize(bucket + 1, T::default());
         }
         self.buckets[bucket] += value;
     }
@@ -69,7 +69,7 @@ mod test {
     use super::*;
 
     // DurationHistogram Tests
-    impl DurationHistogram {
+    impl DurationHistogram<i64> {
         fn to_array(&self) -> Vec<i64> {
             let mut result = vec![];
             let mut buffered_zeroes = 0;
@@ -112,23 +112,23 @@ mod test {
     #[test]
     fn it_buckets_to_zero_and_one() {
         assert_eq!(
-            DurationHistogram::duration_to_bucket(Duration::from_nanos(0)),
+            DurationHistogram::<i64>::duration_to_bucket(Duration::from_nanos(0)),
             0
         );
         assert_eq!(
-            DurationHistogram::duration_to_bucket(Duration::from_nanos(1)),
+            DurationHistogram::<i64>::duration_to_bucket(Duration::from_nanos(1)),
             0
         );
         assert_eq!(
-            DurationHistogram::duration_to_bucket(Duration::from_nanos(999)),
+            DurationHistogram::<i64>::duration_to_bucket(Duration::from_nanos(999)),
             0
         );
         assert_eq!(
-            DurationHistogram::duration_to_bucket(Duration::from_nanos(1000)),
+            DurationHistogram::<i64>::duration_to_bucket(Duration::from_nanos(1000)),
             0
         );
         assert_eq!(
-            DurationHistogram::duration_to_bucket(Duration::from_nanos(1001)),
+            DurationHistogram::<i64>::duration_to_bucket(Duration::from_nanos(1001)),
             1
         );
     }
@@ -136,11 +136,11 @@ mod test {
     #[test]
     fn it_buckets_to_one_and_two() {
         assert_eq!(
-            DurationHistogram::duration_to_bucket(Duration::from_nanos(1100)),
+            DurationHistogram::<i64>::duration_to_bucket(Duration::from_nanos(1100)),
             1
         );
         assert_eq!(
-            DurationHistogram::duration_to_bucket(Duration::from_nanos(1101)),
+            DurationHistogram::<i64>::duration_to_bucket(Duration::from_nanos(1101)),
             2
         );
     }
@@ -148,15 +148,15 @@ mod test {
     #[test]
     fn it_buckets_to_threshold() {
         assert_eq!(
-            DurationHistogram::duration_to_bucket(Duration::from_nanos(10000)),
+            DurationHistogram::<i64>::duration_to_bucket(Duration::from_nanos(10000)),
             25
         );
         assert_eq!(
-            DurationHistogram::duration_to_bucket(Duration::from_nanos(10834)),
+            DurationHistogram::<i64>::duration_to_bucket(Duration::from_nanos(10834)),
             25
         );
         assert_eq!(
-            DurationHistogram::duration_to_bucket(Duration::from_nanos(10835)),
+            DurationHistogram::<i64>::duration_to_bucket(Duration::from_nanos(10835)),
             26
         );
     }
@@ -164,15 +164,15 @@ mod test {
     #[test]
     fn it_buckets_common_times() {
         assert_eq!(
-            DurationHistogram::duration_to_bucket(Duration::from_nanos(1e5 as u64)),
+            DurationHistogram::<i64>::duration_to_bucket(Duration::from_nanos(1e5 as u64)),
             49
         );
         assert_eq!(
-            DurationHistogram::duration_to_bucket(Duration::from_nanos(1e6 as u64)),
+            DurationHistogram::<i64>::duration_to_bucket(Duration::from_nanos(1e6 as u64)),
             73
         );
         assert_eq!(
-            DurationHistogram::duration_to_bucket(Duration::from_nanos(1e9 as u64)),
+            DurationHistogram::<i64>::duration_to_bucket(Duration::from_nanos(1e9 as u64)),
             145
         );
     }
@@ -180,8 +180,8 @@ mod test {
     #[test]
     fn it_limits_to_last_bucket() {
         assert_eq!(
-            DurationHistogram::duration_to_bucket(Duration::from_nanos(1e64 as u64)),
-            DurationHistogram::MAXIMUM_SIZE
+            DurationHistogram::<i64>::duration_to_bucket(Duration::from_nanos(u64::MAX)),
+            DurationHistogram::<i64>::MAXIMUM_SIZE
         );
     }
 }

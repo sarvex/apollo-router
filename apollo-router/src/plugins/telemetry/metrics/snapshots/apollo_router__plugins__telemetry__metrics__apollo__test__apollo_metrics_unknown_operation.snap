@@ -30,7 +30,7 @@ expression: results
             "private_cache_ttl_latency": null,
             "registered_operation": false,
             "forbidden_operation": false,
-            "without_field_instrumentation": false
+            "requests_without_field_instrumentation": 0
           },
           "per_type_stat": {}
         },
