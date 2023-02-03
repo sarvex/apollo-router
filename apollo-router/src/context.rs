@@ -166,7 +166,7 @@ impl Context {
     /// The resolving function must yield a value to be used in the context. It
     /// is provided with the current value to use in evaluating which value to
     /// yield.
-    pub fn upsert_json_value<K>(&self, key: K, upsert: impl Fn(Value) -> Value)
+    pub(crate) fn upsert_json_value<K>(&self, key: K, upsert: impl Fn(Value) -> Value)
     where
         K: Into<String>,
     {
